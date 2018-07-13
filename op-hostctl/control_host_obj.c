@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <openbmc_intf.h>
 #include <openbmc.h>
@@ -81,6 +83,91 @@ fsi_standby()
 }
 
 
+static gboolean run_cmd(const char *path, char * const *argv)
+{
+	char output[1024];
+	pid_t pid;
+	int fd[2];
+	ssize_t n;
+	int ret, wstatus;
+
+	ret = pipe(fd);
+	if (ret == -1) {
+		g_print("ERROR failed to create pipe to run cmd %s\n", path);
+		return FALSE;
+	}
+
+	pid = fork();
+	if (pid == -1) {
+		g_print("ERROR failed to fork to run cmd %s\n", path);
+		return FALSE;
+	}
+
+	if (pid == 0) {
+		close(fd[0]);
+
+		dup2(fd[1], 1);
+		dup2(fd[1], 2);
+
+		close(fd[1]);
+
+		ret = execv(path, argv);
+		exit(ret);
+	}
+
+	close(fd[1]);
+
+	n = read(fd[0], output, sizeof(output));
+	if (n > 0) {
+		g_print("OUTPUT %s\n", output);
+	}
+
+	pid = wait(&wstatus);
+	if (WIFEXITED(wstatus)) {
+		ret = WEXITSTATUS(wstatus);
+		if (ret != 0) {
+			g_print("ERROR failed to run cmd %s, exit code %d\n", path, ret);
+			return FALSE;
+		}
+	} else {
+		g_print("ERROR process failed to run cmd %s\n", path);
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static gboolean
+run_pdbg(unsigned int addr, unsigned int value)
+{
+	char *argv[8];
+	char addr_str[16];
+	char value_str[16];
+	int ret;
+
+	ret = snprintf(addr_str, sizeof(addr_str), "0x%x", addr);
+	if (ret >= sizeof(addr_str)) {
+		g_print("ERROR invalid address 0x%x\n", addr);
+		return FALSE;
+	}
+	ret = snprintf(value_str, sizeof(value_str), "0x%x", value);
+	if (ret >= sizeof(value_str)) {
+		g_print("ERROR invalid value 0x%x\n", value);
+		return FALSE;
+	}
+
+	argv[0] = "pdbg";
+	argv[1] = "-b";
+	argv[2] = "kernel";
+	argv[3] = "-p0";
+	argv[4] = "putcfam";
+	argv[5] = addr_str;
+	argv[6] = value_str;
+	argv[7] = NULL;
+
+	return run_cmd("/usr/bin/pdbg", argv);
+}
+
 static gboolean
 on_boot(ControlHost *host,
 		GDBusMethodInvocation *invocation,
@@ -91,6 +178,7 @@ on_boot(ControlHost *host,
 	GError *error = NULL;
 	GDBusConnection *connection =
 		g_dbus_object_manager_server_get_connection(manager);
+	gboolean ok;
 
 	if (!(fsi_data && fsi_clk && fsi_enable && cronus_sel)) {
 		g_print("ERROR invalid GPIO configuration, will not boot\n");
@@ -139,30 +227,46 @@ on_boot(ControlHost *host,
 		rc |= gpio_clock_cycle(fsi_clk,50);
 		if(rc!=GPIO_OK) { break; }
 
-		rc = fsi_bitbang(attnA);
+		ok = run_pdbg(0x081C, 0x20000000);
+		if (!ok) {
+			g_print("ERROR pdbg attnA failed\n");
+		}
 		rc |= fsi_standby();
 
-		rc |= fsi_bitbang(attnB);
+		ok = run_pdbg(0x100D, 0x40000000);
+		if (!ok) {
+			g_print("ERROR pdbg attnB failed\n");
+		}
 		rc |= fsi_standby();
 
-		rc |= fsi_bitbang(attnC);
+		ok = run_pdbg(0x100B, 0xFFFFFFFF);
+		if (!ok) {
+			g_print("ERROR pdbg attnC failed\n");
+		}
 		rc |= fsi_standby();
 		if(rc!=GPIO_OK) { break; }
 
 		const gchar* flash_side = control_host_get_flash_side(host);
 		g_print("Using %s side of the bios flash\n",flash_side);
 		if(strcmp(flash_side,"primary")==0) {
-			rc |= fsi_bitbang(primary);
+			ok = run_pdbg(0x0281c, 0x30000000);
 		} else if(strcmp(flash_side,"golden") == 0) {
-			rc |= fsi_bitbang(golden);
+			ok = run_pdbg(0x0281c, 0x30900000);
 		} else {
 			g_print("ERROR: Invalid flash side: %s\n",flash_side);
 			rc = 0xff;
-
+			ok = TRUE;
+		}
+		if (!ok) {
+			g_print("ERROR pdbg %s failed\n", flash_side);
 		}
 		rc |= fsi_standby();
 		if(rc!=GPIO_OK) { break; }
 
+		ok = run_pdbg(0x0281c, 0xB0000000);
+		if (!ok) {
+			g_print("ERROR pdbg go failed\n");
+		}
 		rc = fsi_bitbang(go);
 
 		rc |= gpio_write(fsi_data,1); /* Data standby state */
